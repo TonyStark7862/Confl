@@ -1,0 +1,5 @@
+username=your_email@example.com
+token=your_api_token_here
+# You can add comments with # prefix
+# You can use 'password' instead of 'token' if you prefer
+# password=your_password_here
