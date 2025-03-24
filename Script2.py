@@ -83,6 +83,34 @@ class ConfluenceExtractor:
         query_params = parse_qs(parsed_url.query)
         if 'pageId' in query_params:
             return query_params['pageId'][0]
+            
+        # Handle display pattern
+        display_match = re.search(r'/display/([^/]+)/([^/]+)(?:/|$)', parsed_url.path)
+        if display_match:
+            space_key = display_match.group(1)
+            page_title = display_match.group(2).replace('+', ' ')
+            
+            # For this pattern, we'll need to make an API call to get the page ID by title
+            try:
+                base_url = self._extract_base_url(url)
+                api_url = self._get_api_url(base_url)
+                
+                # Search for the page by title in the specified space
+                search_endpoint = f"{api_url}/content"
+                params = {
+                    'title': page_title.replace('+', ' '),
+                    'spaceKey': space_key,
+                    'expand': 'version'
+                }
+                
+                response = self.session.get(search_endpoint, params=params, verify=False)
+                
+                if response.status_code == 200:
+                    results = response.json()
+                    if results['results'] and len(results['results']) > 0:
+                        return results['results'][0]['id']
+            except Exception as e:
+                logger.error(f"Error finding page ID by title: {e}")
         
         logger.warning(f"Could not extract page ID from URL: {url}")
         return None
