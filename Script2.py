@@ -8,8 +8,6 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, unquote
 import warnings
 import logging
-import shutil
-from pathlib import Path
 import time
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
@@ -417,40 +415,129 @@ class ConfluenceExtractor:
     
     def _extract_text(self, soup):
         """
-        Extract clean text content.
+        Extract clean text content with preserved structure.
         
         Args:
             soup (BeautifulSoup): Parsed HTML
             
         Returns:
-            str: Clean text
+            str: Clean text with preserved structure
         """
         # Clone the soup to avoid modifying the original
         soup_clone = BeautifulSoup(str(soup), 'html.parser')
         
-        # Remove script and style elements
-        for element in soup_clone(['script', 'style', 'noscript']):
+        # Remove script, style, and other non-content elements
+        for element in soup_clone(['script', 'style', 'noscript', 'svg', 'iframe', 'form']):
             element.decompose()
         
-        # Get text
-        text = soup_clone.get_text()
+        # Process headers to maintain hierarchy
+        structured_text = []
         
-        # Clean up the text
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = '\n'.join(chunk for chunk in chunks if chunk)
+        # Extract title if available
+        title_elem = soup_clone.find(['h1', 'title'], class_=lambda x: x and ('title' in x or 'pageTitle' in x))
+        if title_elem:
+            structured_text.append(f"# {title_elem.get_text().strip()}\n")
+        
+        # Track tables and images for reference
+        table_count = 0
+        image_count = 0
+        
+        # Process the content with structure preservation
+        for element in soup_clone.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div', 'pre', 'ul', 'ol', 'table', 'blockquote', 'img']):
+            # Skip if the element is inside another container we're already processing
+            if element.parent.name in ['div', 'blockquote'] and element.parent in soup_clone.find_all(['div', 'blockquote']):
+                continue
+                
+            # Skip empty elements and navigation elements
+            if not element.get_text().strip() and element.name != 'img':
+                continue
+                
+            if any(cls in element.get('class', []) for cls in ['pagetree', 'navitem', 'breadcrumb']):
+                continue
+                
+            # Process based on element type
+            if element.name.startswith('h') and len(element.name) == 2:
+                level = int(element.name[1])
+                prefix = '#' * level
+                structured_text.append(f"\n{prefix} {element.get_text().strip()}\n")
+            
+            elif element.name == 'p':
+                text = element.get_text().strip()
+                if text:
+                    structured_text.append(f"{text}\n")
+            
+            elif element.name == 'div' and element.get('class') and any(cls in element.get('class') for cls in ['code', 'codeBlock']):
+                code = element.get_text().strip()
+                if code:
+                    structured_text.append(f"\n```\n{code}\n```\n")
+            
+            elif element.name == 'pre':
+                code = element.get_text().strip()
+                if code:
+                    structured_text.append(f"\n```\n{code}\n```\n")
+            
+            elif element.name == 'ul':
+                items = []
+                for li in element.find_all('li', recursive=False):
+                    items.append(f"- {li.get_text().strip()}")
+                if items:
+                    structured_text.append("\n" + "\n".join(items) + "\n")
+            
+            elif element.name == 'ol':
+                items = []
+                for i, li in enumerate(element.find_all('li', recursive=False), 1):
+                    items.append(f"{i}. {li.get_text().strip()}")
+                if items:
+                    structured_text.append("\n" + "\n".join(items) + "\n")
+            
+            elif element.name == 'blockquote':
+                quote = element.get_text().strip().replace('\n', '\n> ')
+                if quote:
+                    structured_text.append(f"\n> {quote}\n")
+            
+            elif element.name == 'table':
+                table_count += 1
+                structured_text.append(f"\n[TABLE {table_count}: See tables/table_{table_count}.csv or tables/table_{table_count}.html]\n")
+            
+            elif element.name == 'img':
+                # Skip small icons and emoticons
+                src = element.get('src', '')
+                if src and not any(skip in src.lower() for skip in ['emoticon', 'icon', 'spacer', 'blank.gif']):
+                    image_count += 1
+                    alt_text = element.get('alt', '').strip() or element.get('title', '').strip() or f'image_{image_count}'
+                    structured_text.append(f"\n[IMAGE: {alt_text} - See images/image_{image_count}.png]\n")
+            
+            elif element.name == 'div':
+                # For general divs, only add their content if they have substance and aren't just containers
+                text = element.get_text().strip()
+                if text and len(text) > 10 and not any(cls in element.get('class', []) for cls in ['panel', 'container', 'wrapper']):
+                    structured_text.append(f"{text}\n")
+        
+        # Join all parts and clean up
+        text = "\n".join(structured_text)
+        
+        # Clean up the text - remove excessive newlines, etc.
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        # Replace common Unicode issues
+        text = text.replace('\u00a0', ' ')  # Replace non-breaking spaces
+        text = text.replace('\u2019', "'")  # Replace smart quotes
+        text = text.replace('\u201c', '"')  # Replace smart quotes
+        text = text.replace('\u201d', '"')  # Replace smart quotes
+        text = text.replace('\u2013', '-')  # Replace en dash
+        text = text.replace('\u2014', '--')  # Replace em dash
         
         return text
     
     def _extract_tables(self, soup):
         """
-        Extract tables from HTML.
+        Extract tables from HTML with improved accuracy.
         
         Args:
             soup (BeautifulSoup): Parsed HTML
             
         Returns:
-            list: List of extracted tables as pandas DataFrames
+            list: List of extracted tables as pandas DataFrames with accurate content
         """
         tables = []
         
@@ -458,50 +545,108 @@ class ConfluenceExtractor:
             # Skip navigation and layout tables
             if any(cls in table.get('class', []) for cls in ['pagetree', 'navtable', 'layout']):
                 continue
-                
-            data = []
+            
+            # First, check if this is a confluence table with CSS classes
+            is_confluence_table = any(cls in table.get('class', []) for cls in ['confluenceTable', 'data-table', 'grid'])
+            
+            # Prepare data structure
+            all_data = []
             headers = []
             
-            # Get headers
+            # Get headers from thead if available
             thead = table.find('thead')
             if thead:
                 header_row = thead.find('tr')
                 if header_row:
-                    headers = [cell.get_text().strip() for cell in header_row.find_all(['th', 'td'])]
+                    headers = []
+                    for cell in header_row.find_all(['th', 'td']):
+                        # Get all text inside the cell, preserve structure
+                        cell_text = cell.get_text().strip()
+                        # Replace newlines and multiple spaces
+                        cell_text = re.sub(r'\s+', ' ', cell_text)
+                        headers.append(cell_text)
             
-            # If no headers in thead, try the first row
+            # If no headers in thead, check if the first row has th elements
             if not headers:
                 first_row = table.find('tr')
                 if first_row:
+                    potential_headers = []
+                    all_header_cells = True
+                    
                     for cell in first_row.find_all(['th', 'td']):
-                        # Check if it's a header cell
-                        if cell.name == 'th' or 'header' in cell.get('class', []):
-                            headers.append(cell.get_text().strip())
-                        else:
-                            # Just a regular cell in the first row
-                            headers.append(f"Column {len(headers) + 1}")
+                        cell_text = cell.get_text().strip()
+                        cell_text = re.sub(r'\s+', ' ', cell_text)
+                        potential_headers.append(cell_text)
+                        
+                        # Check if this is actually a header cell
+                        if cell.name != 'th' and not any(cls in cell.get('class', []) for cls in ['header', 'confluenceTh']):
+                            all_header_cells = False
+                    
+                    # If all cells are header-like or it's a confluence table, use them as headers
+                    if all_header_cells or (is_confluence_table and potential_headers):
+                        headers = potential_headers
             
-            # Get data rows
-            tbody = table.find('tbody')
-            if tbody:
-                rows = tbody.find_all('tr')
+            # Get table body rows
+            if table.find('tbody'):
+                rows = table.find('tbody').find_all('tr')
             else:
-                # If no tbody, get all rows and skip the first if we have headers
                 rows = table.find_all('tr')
-                if headers and rows:
+                # Skip first row if we're using it as headers
+                if headers and rows and not thead:
                     rows = rows[1:]
             
+            # Process each row
             for row in rows:
-                row_data = [cell.get_text().strip() for cell in row.find_all(['td', 'th'])]
+                row_data = []
+                for cell in row.find_all(['td', 'th']):
+                    # Handle colspan and rowspan
+                    colspan = int(cell.get('colspan', 1))
+                    
+                    # Get cell text, preserve links
+                    links = []
+                    for a in cell.find_all('a'):
+                        href = a.get('href', '')
+                        if href and not href.startswith('#'):
+                            if a.get_text().strip():
+                                links.append(f"{a.get_text().strip()} [{href}]")
+                    
+                    # Get just the text
+                    cell_text = cell.get_text().strip()
+                    cell_text = re.sub(r'\s+', ' ', cell_text)
+                    
+                    # Add links if available and not already in the text
+                    if links and not any(link in cell_text for link in links):
+                        cell_text += " " + " ".join(links)
+                    
+                    # Add cell to row data, respecting colspan
+                    for _ in range(colspan):
+                        row_data.append(cell_text)
+                
                 if row_data:  # Skip empty rows
-                    data.append(row_data)
+                    all_data.append(row_data)
             
             # Create DataFrame
-            if data:
-                if headers and len(headers) == len(data[0]):
-                    df = pd.DataFrame(data, columns=headers)
+            if all_data:
+                # Ensure data is consistent
+                max_cols = max(len(row) for row in all_data)
+                
+                # Ensure all rows have the same number of columns
+                for row in all_data:
+                    while len(row) < max_cols:
+                        row.append("")
+                
+                # If headers are available and match column count
+                if headers and len(headers) == max_cols:
+                    df = pd.DataFrame(all_data, columns=headers)
+                elif headers:
+                    # Headers don't match column count, extend or truncate
+                    while len(headers) < max_cols:
+                        headers.append(f"Column {len(headers) + 1}")
+                    headers = headers[:max_cols]
+                    df = pd.DataFrame(all_data, columns=headers)
                 else:
-                    df = pd.DataFrame(data)
+                    # No headers, use default column names
+                    df = pd.DataFrame(all_data, columns=[f"Column {i+1}" for i in range(max_cols)])
                 
                 tables.append(df)
         
@@ -509,7 +654,7 @@ class ConfluenceExtractor:
     
     def _extract_images(self, soup):
         """
-        Extract images from HTML.
+        Extract images from HTML with improved image type detection.
         
         Args:
             soup (BeautifulSoup): Parsed HTML
@@ -530,24 +675,54 @@ class ConfluenceExtractor:
             title = img.get('title', '').strip() or alt
             
             if src:
+                image_info = {
+                    'src': src,
+                    'alt': alt,
+                    'title': title
+                }
+                
                 if src.startswith('data:image'):
                     # Handle data URLs
-                    image_type = 'data-url'
+                    image_info['type'] = 'data-url'
+                    
+                    # Try to extract format from data URL
+                    data_url_pattern = re.compile(r'data:image/(?P<format>.*?)[;,]')
+                    match = data_url_pattern.match(src)
+                    if match:
+                        image_info['format'] = match.group('format')
                 else:
                     # Handle regular URLs
-                    image_type = 'url'
+                    image_info['type'] = 'url'
+                    
+                    # Extract format from URL
+                    if '.' in src.split('/')[-1]:
+                        ext = src.split('.')[-1].lower().split('?')[0]
+                        if ext in ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'tiff']:
+                            image_info['format'] = ext
                     
                     # Make relative URLs absolute
                     if src.startswith('/'):
-                        # We'll fix this later when we have the base URL
-                        image_type = 'relative'
+                        image_info['type'] = 'relative'
                 
-                images.append({
-                    'src': src,
-                    'type': image_type,
-                    'alt': alt,
-                    'title': title
-                })
+                # Check for specific confluence image classes or patterns
+                parent = img.parent
+                if parent and parent.name == 'div' and parent.get('class'):
+                    # Check for Confluence image container
+                    if any(cls in parent.get('class') for cls in ['confluence-embedded-image', 'image-container']):
+                        # See if there's a high-res version available
+                        if parent.get('data-image-src'):
+                            image_info['src'] = parent.get('data-image-src')
+                            image_info['type'] = 'url'
+                            image_info['high_res'] = True
+                            
+                # Get image dimensions if available
+                width = img.get('width')
+                height = img.get('height')
+                if width and height:
+                    image_info['width'] = width
+                    image_info['height'] = height
+                
+                images.append(image_info)
         
         return images
     
@@ -602,28 +777,32 @@ class ConfluenceExtractor:
         Returns:
             dict: Dictionary of ordered and unordered lists
         """
-        lists = {
+        result = {
             'ordered': [],
             'unordered': []
         }
         
         # Extract ordered lists
-        for ol in soup.find_all('ol'):
-            items = [li.get_text().strip() for li in ol.find_all('li', recursive=False)]
+        ordered_lists = soup.find_all('ol')
+        for ordered_list in ordered_lists:
+            list_items = ordered_list.find_all('li', recursive=False)
+            items = [item.get_text().strip() for item in list_items]
             if items:
-                lists['ordered'].append(items)
+                result['ordered'].append(items)
         
         # Extract unordered lists
-        for ul in soup.find_all('ul'):
-            items = [li.get_text().strip() for li in ol.find_all('li', recursive=False)]
+        unordered_lists = soup.find_all('ul')
+        for unordered_list in unordered_lists:
+            list_items = unordered_list.find_all('li', recursive=False)
+            items = [item.get_text().strip() for item in list_items]
             if items:
-                lists['unordered'].append(items)
+                result['unordered'].append(items)
         
-        return lists
+        return result
     
     def _save_content(self, content, output_dir, extract_images=True, save_tables=True, save_code=True):
         """
-        Save extracted content to disk.
+        Save extracted content to disk with improved formatting and structure.
         
         Args:
             content (dict): Extracted content
@@ -635,12 +814,15 @@ class ConfluenceExtractor:
         # Make sure the output directory exists
         os.makedirs(output_dir, exist_ok=True)
         
-        # Save text content to a file
+        # Save text content to a file - use both plain text and markdown
         if 'text' in content:
             with open(os.path.join(output_dir, 'content.txt'), 'w', encoding='utf-8') as f:
                 f.write(content['text'])
+                
+            with open(os.path.join(output_dir, 'content.md'), 'w', encoding='utf-8') as f:
+                f.write(content['text'])
             
-            logger.info(f"Saved text content to {os.path.join(output_dir, 'content.txt')}")
+            logger.info(f"Saved text content to {os.path.join(output_dir, 'content.txt')} and {os.path.join(output_dir, 'content.md')}")
         
         # Save original HTML
         if 'html' in content:
@@ -656,7 +838,27 @@ class ConfluenceExtractor:
             
             for i, table in enumerate(content['tables']):
                 table_file = os.path.join(tables_dir, f'table_{i+1}.csv')
-                table.to_csv(table_file, index=False, encoding='utf-8')
+                
+                try:
+                    # Save to CSV with proper encoding
+                    table.to_csv(table_file, index=False, encoding='utf-8-sig')
+                    
+                    # Also save as HTML and Excel for better formatting
+                    html_file = os.path.join(tables_dir, f'table_{i+1}.html')
+                    excel_file = os.path.join(tables_dir, f'table_{i+1}.xlsx')
+                    
+                    # Save HTML version
+                    with open(html_file, 'w', encoding='utf-8') as f:
+                        f.write(table.to_html(index=False, na_rep='', border=1))
+                    
+                    # Save Excel version if pandas has ExcelWriter
+                    try:
+                        table.to_excel(excel_file, index=False, engine='openpyxl')
+                    except Exception as e:
+                        logger.warning(f"Could not save Excel version of table: {e}")
+                        
+                except Exception as e:
+                    logger.error(f"Error saving table {i+1}: {e}")
             
             logger.info(f"Saved {len(content['tables'])} tables to {tables_dir}")
         
@@ -687,9 +889,17 @@ class ConfluenceExtractor:
             
             for i, image in enumerate(content['images']):
                 try:
-                    image_file = os.path.join(images_dir, f'image_{i+1}.jpg')  # Default extension
+                    # Create a more descriptive filename
+                    image_name = image.get('title', '') or image.get('alt', '') or f'image_{i+1}'
+                    image_name = self._sanitize_filename(image_name)
+                    if not image_name or len(image_name) < 3:
+                        image_name = f'image_{i+1}'
                     
-                    if image['type'] == 'data-url':
+                    # Default extension and file path
+                    default_ext = '.png'  # Default to PNG instead of JPG
+                    image_file = os.path.join(images_dir, f"{image_name}{default_ext}")
+                    
+                    if image.get('type') == 'data-url':
                         # Handle data URLs
                         data_url = image['src']
                         data_url_pattern = re.compile(r'data:image/(?P<format>.*?);base64,(?P<data>.*)')
@@ -700,7 +910,76 @@ class ConfluenceExtractor:
                             image_data = match.group('data')
                             
                             # Update the file extension
-                            image_file = os.path.join(images_dir, f'image_{i+1}.{image_format}')
+                            image_file = os.path.join(images_dir, f"{image_name}.{image_format}")
+                            
+                            # Save the image
+                            with open(image_file, 'wb') as f:
+                                f.write(base64.b64decode(image_data))
+                    else:
+                        # Handle URL images
+                        image_url = image['src']
+                        
+                        # Resolve relative URLs
+                        if image.get('type') == 'relative' and base_url:
+                            if image_url.startswith('/'):
+                                image_url = f"{base_url}{image_url}"
+                            else:
+                                image_url = f"{base_url}/{image_url}"
+                        
+                        # Handle Confluence specific URLs
+                        if '/attachments/' in image_url and '?effects=border-simple' in image_url:
+                            # Remove Confluence image effects to get original image
+                            image_url = image_url.split('?effects=')[0]
+                        
+                        # Download the image
+                        img_response = self.session.get(image_url, verify=False)
+                        
+                        if img_response.status_code == 200:
+                            # Determine the file extension from Content-Type or URL
+                            content_type = img_response.headers.get('Content-Type', '')
+                            
+                            if 'image/' in content_type:
+                                ext = content_type.split('/')[-1].split(';')[0].lower()
+                                if ext == 'jpeg':
+                                    ext = 'jpg'
+                                if ext in ['png', 'jpg', 'gif', 'svg', 'webp']:
+                                    image_file = os.path.join(images_dir, f"{image_name}.{ext}")
+                            elif 'format' in image:
+                                image_file = os.path.join(images_dir, f"{image_name}.{image['format']}")
+                            elif '.' in image_url.split('/')[-1]:
+                                url_ext = image_url.split('.')[-1].lower().split('?')[0]
+                                if url_ext in ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp']:
+                                    if url_ext == 'jpeg':
+                                        url_ext = 'jpg'
+                                    image_file = os.path.join(images_dir, f"{image_name}.{url_ext}")
+                            
+                            # Save the image
+                            with open(image_file, 'wb') as f:
+                                f.write(img_response.content)
+                except Exception as e:
+                    logger.error(f"Error saving image {i+1}: {e}")
+            
+            logger.info(f"Saved images to {images_dir}")
+        
+        # Create a metadata file
+        metadata = {
+            'title': content.get('title', 'Unknown'),
+            'url': content.get('url', ''),
+            'extraction_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'content_stats': {
+                'tables': len(content.get('tables', [])),
+                'code_blocks': len(content.get('code_blocks', [])),
+                'images': len(content.get('images', [])),
+                'text_length': len(content.get('text', '')),
+                'lists': {
+                    'ordered': len(content.get('lists', {}).get('ordered', [])),
+                    'unordered': len(content.get('lists', {}).get('unordered', []))
+                }
+            }
+        }
+        
+        with open(os.path.join(output_dir, 'metadata.json'), 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2)file = os.path.join(images_dir, f'image_{i+1}.{image_format}')
                             
                             # Save the image
                             with open(image_file, 'wb') as f:
@@ -829,7 +1108,7 @@ def extract_confluence_content(url, output_dir=None, config_path='config.txt',
         output_dir (str): Directory to save content
         config_path (str): Path to configuration file
         include_children (bool): Whether to extract child pages
-        max_depth (int): Maximum depth for child pages
+        max_depth (int or str): Maximum depth for child pages (use "all" for all possible children)
         extract_images (bool): Whether to extract images
         save_tables (bool): Whether to save tables
         save_code (bool): Whether to save code blocks
@@ -838,6 +1117,10 @@ def extract_confluence_content(url, output_dir=None, config_path='config.txt',
         dict: Results of the extraction
     """
     extractor = ConfluenceExtractor()
+    
+    # Handle "all" max_depth by setting it to a very large number
+    if max_depth == "all":
+        max_depth = 999  # Effectively unlimited depth
     
     try:
         result = extractor.extract_content(
@@ -850,6 +1133,7 @@ def extract_confluence_content(url, output_dir=None, config_path='config.txt',
             save_tables=save_tables,
             save_code=save_code
         )
+        
         
         if result:
             logger.info(f"Successfully extracted content from {url}")
@@ -874,12 +1158,20 @@ def main():
     parser.add_argument('--output', '-o', help='Output directory (default: auto-generated)')
     parser.add_argument('--config', '-c', default='config.txt', help='Path to config file (default: config.txt)')
     parser.add_argument('--children', '-r', action='store_true', help='Extract child pages')
-    parser.add_argument('--depth', '-d', type=int, default=1, help='Maximum depth for child pages (default: 1)')
+    parser.add_argument('--depth', '-d', default=1, help='Maximum depth for child pages (default: 1, use "all" for unlimited)')
     parser.add_argument('--no-images', action='store_true', help='Skip image extraction')
     parser.add_argument('--no-tables', action='store_true', help='Skip table extraction')
     parser.add_argument('--no-code', action='store_true', help='Skip code block extraction')
     
     args = parser.parse_args()
+    
+    # Convert depth to int if it's not "all"
+    if args.depth != "all":
+        try:
+            args.depth = int(args.depth)
+        except ValueError:
+            print(f"Warning: Invalid depth value '{args.depth}'. Using default depth of 1.")
+            args.depth = 1
     
     result = extract_confluence_content(
         url=args.url,
