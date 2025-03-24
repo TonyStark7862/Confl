@@ -2,11 +2,15 @@ import requests
 import re
 import os
 import json
+import base64
 import pandas as pd
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, unquote
 import warnings
 import logging
+import shutil
+from pathlib import Path
+import time
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 # Configure logging
@@ -18,30 +22,180 @@ warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 class ConfluenceExtractor:
     """
-    A simplified class to extract content from any Confluence URL
-    without requiring deep knowledge of Confluence structures.
+    A user-friendly class to extract content from any Confluence URL
+    without requiring knowledge of Confluence structures.
     """
     
-    def __init__(self, username=None, api_token=None):
-        """
-        Initialize the ConfluenceExtractor with optional authentication details.
-        
-        Args:
-            username (str, optional): Username for Basic Auth
-            api_token (str, optional): API token or password for Basic Auth
-        """
+    def __init__(self):
+        """Initialize the ConfluenceExtractor."""
         self.session = requests.Session()
-        
-        # Set basic authentication if credentials are provided
-        if username and api_token:
-            self.session.auth = (username, api_token)
-        
-        # Set headers
         self.session.headers.update({
             'Content-Type': 'application/json',
             'Accept': 'application/json'
         })
-
+        
+    def _load_credentials(self, config_path='config.txt'):
+        """
+        Load credentials from config file.
+        
+        Args:
+            config_path (str): Path to configuration file
+            
+        Returns:
+            tuple: (username, password)
+        """
+        try:
+            if not os.path.exists(config_path):
+                logger.warning(f"Config file not found: {config_path}")
+                return None, None
+                
+            with open(config_path, 'r') as file:
+                config_data = file.read().strip().split('\n')
+            
+            config = {}
+            for line in config_data:
+                if '=' in line and not line.strip().startswith('#'):
+                    key, value = line.split('=', 1)
+                    config[key.strip()] = value.strip()
+            
+            username = config.get('username')
+            token = config.get('token') or config.get('password')
+            
+            return username, token
+        except Exception as e:
+            logger.error(f"Error reading config file: {e}")
+            return None, None
+    
+    def _setup_auth(self, config_path='config.txt'):
+        """
+        Set up authentication from config file.
+        
+        Args:
+            config_path (str): Path to configuration file
+        """
+        username, token = self._load_credentials(config_path)
+        if username and token:
+            self.session.auth = (username, token)
+            logger.info(f"Authentication set up for user: {username}")
+        else:
+            logger.warning("No authentication credentials found or loaded")
+    
+    def extract_content(self, url, config_path='config.txt', output_dir=None, 
+                       include_children=False, max_depth=1, extract_images=True, 
+                       save_tables=True, save_code=True):
+        """
+        Extract all content from a Confluence page and save it locally.
+        
+        Args:
+            url (str): The Confluence page URL
+            config_path (str): Path to configuration file with credentials
+            output_dir (str): Directory to save content (if None, creates based on page title)
+            include_children (bool): Whether to extract child pages
+            max_depth (int): Maximum depth for child pages
+            extract_images (bool): Whether to extract and save images
+            save_tables (bool): Whether to save tables as CSV files
+            save_code (bool): Whether to save code blocks as separate files
+            
+        Returns:
+            dict: Content extraction results
+        """
+        # Set up authentication
+        self._setup_auth(config_path)
+        
+        # Extract content
+        content = self._get_page_content(url)
+        
+        if not content:
+            logger.error(f"Failed to extract content from {url}")
+            return None
+        
+        # Create output directory if not specified
+        if not output_dir:
+            # Extract space key and title from URL for folder name
+            parsed_url = urlparse(url)
+            path_parts = parsed_url.path.split('/')
+            
+            # Look for 'display' in the URL path
+            if 'display' in path_parts:
+                display_index = path_parts.index('display')
+                if display_index + 2 < len(path_parts):
+                    space_key = path_parts[display_index + 1]
+                    page_title = unquote(path_parts[display_index + 2].replace('+', ' '))
+                    output_dir = f"{space_key}_{page_title}"
+                else:
+                    output_dir = "confluence_content"
+            else:
+                output_dir = "confluence_content"
+            
+            # Make sure the directory name is valid
+            output_dir = "".join(c for c in output_dir if c.isalnum() or c in "_ -").rstrip()
+            
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Saving content to directory: {output_dir}")
+        
+        # Save content
+        self._save_content(content, output_dir, extract_images, save_tables, save_code)
+        
+        # Extract child pages if requested
+        if include_children and 'child_pages' in content and content['child_pages'] and max_depth > 0:
+            child_results = []
+            for child in content['child_pages']:
+                child_url = child.get('url')
+                if not child_url and 'id' in child:
+                    # Construct URL if not available
+                    base_url = self._extract_base_url(url)
+                    if 'atlassian.net' in url:
+                        child_url = f"{base_url}/pages/{child['id']}"
+                    else:
+                        child_url = f"{base_url}/pages/viewpage.action?pageId={child['id']}"
+                
+                if child_url:
+                    logger.info(f"Processing child page: {child['title']}")
+                    child_dir = os.path.join(output_dir, "children", self._sanitize_filename(child['title']))
+                    child_result = self.extract_content(
+                        child_url, 
+                        config_path=config_path,
+                        output_dir=child_dir,
+                        include_children=include_children,
+                        max_depth=max_depth-1,
+                        extract_images=extract_images,
+                        save_tables=save_tables,
+                        save_code=save_code
+                    )
+                    if child_result:
+                        child_results.append(child_result)
+            
+            content['extracted_children'] = child_results
+        
+        return {
+            'title': content.get('title', 'Unknown'),
+            'url': url,
+            'output_directory': output_dir,
+            'has_children': 'child_pages' in content and bool(content['child_pages']),
+            'children_extracted': include_children and max_depth > 0
+        }
+    
+    def _get_page_content(self, url):
+        """
+        Get content from a Confluence page using multiple methods.
+        
+        Args:
+            url (str): The Confluence page URL
+            
+        Returns:
+            dict: Page content or None if failed
+        """
+        logger.info(f"Extracting content from: {url}")
+        
+        # Try different methods to get the content
+        content = self._try_api_by_url_pattern(url)
+        
+        if not content:
+            content = self._try_direct_html(url)
+        
+        return content
+    
     def _extract_base_url(self, url):
         """
         Extract the base URL from a Confluence page URL.
@@ -55,150 +209,185 @@ class ConfluenceExtractor:
         parsed_url = urlparse(url)
         base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
         
-        # Check if it's a standard wiki path
-        if parsed_url.path.startswith('/wiki'):
-            base_url += '/wiki'
+        # Check if it includes the context path
+        path_parts = parsed_url.path.split('/')
+        if len(path_parts) > 1 and path_parts[1] in ['wiki', 'confluence', 'ETCB']:
+            base_url += f"/{path_parts[1]}"
+            # Check if there's another context path
+            if len(path_parts) > 2 and path_parts[2] == 'confluence':
+                base_url += "/confluence"
             
         return base_url
-
-    def _extract_page_id(self, url):
+    
+    def _try_api_by_url_pattern(self, url):
         """
-        Extract the page ID from any Confluence URL.
+        Try to extract content by recognizing the URL pattern and using the appropriate API.
         
         Args:
             url (str): The Confluence page URL
             
         Returns:
-            str: The page ID or None if not found
+            dict: Content or None if failed
         """
-        # Parse the URL
-        parsed_url = urlparse(url)
-        
-        # Try to find the page ID in the URL path (cloud pattern)
-        page_id_match = re.search(r'/pages/(\d+)', parsed_url.path)
-        if page_id_match:
-            return page_id_match.group(1)
-        
-        # Try to find the page ID in query parameters (server pattern)
-        query_params = parse_qs(parsed_url.query)
-        if 'pageId' in query_params:
-            return query_params['pageId'][0]
+        try:
+            base_url = self._extract_base_url(url)
+            api_url = f"{base_url}/rest/api"
             
-        # Handle display pattern
-        display_match = re.search(r'/display/([^/]+)/([^/]+)(?:/|$)', parsed_url.path)
-        if display_match:
-            space_key = display_match.group(1)
-            page_title = display_match.group(2).replace('+', ' ')
+            # Handle display pattern URLs
+            parsed_url = urlparse(url)
+            path_parts = parsed_url.path.split('/')
             
-            # For this pattern, we'll need to make an API call to get the page ID by title
-            try:
-                base_url = self._extract_base_url(url)
-                api_url = self._get_api_url(base_url)
-                
-                # Search for the page by title in the specified space
-                search_endpoint = f"{api_url}/content"
-                params = {
-                    'title': page_title.replace('+', ' '),
-                    'spaceKey': space_key,
-                    'expand': 'version'
-                }
-                
-                response = self.session.get(search_endpoint, params=params, verify=False)
-                
-                if response.status_code == 200:
-                    results = response.json()
-                    if results['results'] and len(results['results']) > 0:
-                        return results['results'][0]['id']
-            except Exception as e:
-                logger.error(f"Error finding page ID by title: {e}")
-        
-        logger.warning(f"Could not extract page ID from URL: {url}")
-        return None
-
-    def _get_api_url(self, base_url):
-        """
-        Determine the API URL based on the base URL.
-        
-        Args:
-            base_url (str): The base URL of the Confluence instance
+            # Look for 'display' in the URL path
+            if 'display' in path_parts:
+                display_index = path_parts.index('display')
+                if display_index + 2 < len(path_parts):
+                    space_key = path_parts[display_index + 1]
+                    page_title = unquote(path_parts[display_index + 2].replace('+', ' '))
+                    
+                    logger.info(f"Detected display URL pattern. Space: {space_key}, Title: {page_title}")
+                    
+                    # Try to get content by space key and title
+                    endpoint = f"{api_url}/content"
+                    params = {
+                        'spaceKey': space_key,
+                        'title': page_title,
+                        'expand': 'body.storage,children.page'
+                    }
+                    
+                    response = self.session.get(endpoint, params=params, verify=False)
+                    
+                    if response.status_code == 200:
+                        results = response.json()
+                        if results.get('results') and len(results['results']) > 0:
+                            page_data = results['results'][0]
+                            
+                            # Extract HTML content
+                            if 'body' in page_data and 'storage' in page_data['body']:
+                                html_content = page_data['body']['storage']['value']
+                                
+                                # Parse content
+                                content = self._parse_html_content(html_content)
+                                
+                                # Add metadata
+                                content['title'] = page_data['title']
+                                content['url'] = url
+                                
+                                # Get child pages if available
+                                if 'children' in page_data and 'page' in page_data['children'] and 'results' in page_data['children']['page']:
+                                    child_pages = page_data['children']['page']['results']
+                                    content['child_pages'] = [
+                                        {'title': child['title'], 'id': child['id']} 
+                                        for child in child_pages
+                                    ]
+                                
+                                return content
             
-        Returns:
-            str: The API URL
+            return None
+        except Exception as e:
+            logger.error(f"Error using API to extract content: {e}")
+            return None
+    
+    def _try_direct_html(self, url):
         """
-        return f"{base_url}/rest/api"
-
-    def get_page_content(self, url, username=None, api_token=None):
-        """
-        Get all text content from a Confluence page using just the URL.
-        Handles authentication automatically.
+        Try to extract content by directly requesting the page HTML.
         
         Args:
             url (str): The Confluence page URL
-            username (str, optional): Override the default username
-            api_token (str, optional): Override the default API token
             
         Returns:
-            dict: A dictionary with all the extracted content
+            dict: Content or None if failed
         """
-        # Override session auth if new credentials provided
-        if username and api_token:
-            self.session.auth = (username, api_token)
-        
-        # Extract base URL and page ID
-        base_url = self._extract_base_url(url)
-        page_id = self._extract_page_id(url)
-        
-        if not page_id:
-            raise ValueError(f"Could not extract page ID from URL: {url}")
-        
-        # Get the API URL
-        api_url = self._get_api_url(base_url)
-        
-        # Get page content
-        endpoint = f"{api_url}/content/{page_id}?expand=body.storage,children.page"
-        response = self.session.get(endpoint, verify=False)
-        
-        if response.status_code == 200:
-            page_data = response.json()
+        try:
+            logger.info(f"Trying direct HTML extraction from: {url}")
             
-            # Extract HTML content
-            html_content = page_data['body']['storage']['value']
+            # Make direct request to the page
+            response = self.session.get(url, verify=False)
             
-            # Parse content with BeautifulSoup
-            content = self._extract_content(html_content)
+            if response.status_code == 200:
+                # Parse the HTML
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Try to find the title
+                title_elem = soup.find('title')
+                title = title_elem.text.strip() if title_elem else "Unknown Title"
+                
+                # Try to find the main content
+                content_div = None
+                
+                # Try different selectors for the main content area
+                for selector in [
+                    'div#main-content', 
+                    'div#content', 
+                    'div.wiki-content',
+                    'div.confluenceContent', 
+                    'div.content-container'
+                ]:
+                    content_div = soup.select_one(selector)
+                    if content_div:
+                        break
+                
+                if not content_div:
+                    # Last resort: try to find any large div that might be the content
+                    largest_div = None
+                    max_size = 0
+                    
+                    for div in soup.find_all('div'):
+                        div_content = div.get_text()
+                        if len(div_content) > max_size:
+                            max_size = len(div_content)
+                            largest_div = div
+                    
+                    content_div = largest_div
+                
+                if content_div:
+                    # Parse the content
+                    content = self._parse_html_content(str(content_div))
+                    
+                    # Add metadata
+                    content['title'] = title
+                    content['url'] = url
+                    
+                    # Try to find child pages
+                    child_links = []
+                    
+                    # Look for navigation elements that might contain child pages
+                    for nav in soup.select('.children, .child-pages, .pagetree'):
+                        for link in nav.find_all('a'):
+                            href = link.get('href')
+                            if href and not href.startswith(('#', 'javascript:')):
+                                # Make relative URLs absolute
+                                if not href.startswith(('http://', 'https://')):
+                                    base_url = self._extract_base_url(url)
+                                    if href.startswith('/'):
+                                        href = f"{base_url}{href}"
+                                    else:
+                                        href = f"{base_url}/{href}"
+                                
+                                child_links.append({
+                                    'title': link.text.strip(),
+                                    'url': href
+                                })
+                    
+                    if child_links:
+                        content['child_pages'] = child_links
+                    
+                    return content
             
-            # Add page metadata
-            content['title'] = page_data['title']
-            content['url'] = url
-            
-            # Get child pages if available
-            if 'children' in page_data and 'page' in page_data['children'] and 'results' in page_data['children']['page']:
-                child_pages = page_data['children']['page']['results']
-                content['child_pages'] = [
-                    {'title': child['title'], 'id': child['id']} 
-                    for child in child_pages
-                ]
-            
-            return content
-        else:
-            logger.error(f"Failed to get page content. Status code: {response.status_code}")
-            if response.status_code == 401:
-                raise ValueError("Authentication failed. Please check your username and API token.")
-            elif response.status_code == 404:
-                raise ValueError(f"Page not found. Please check the URL: {url}")
-            else:
-                logger.error(f"Response: {response.text}")
-                raise ValueError(f"Failed to get page content: {response.text}")
-
-    def _extract_content(self, html_content):
+            logger.warning(f"Failed to extract content directly. Status code: {response.status_code}")
+            return None
+        except Exception as e:
+            logger.error(f"Error extracting content directly: {e}")
+            return None
+    
+    def _parse_html_content(self, html_content):
         """
-        Extract all useful content from HTML.
+        Parse HTML content to extract text, tables, code blocks, and images.
         
         Args:
-            html_content (str): The HTML content
+            html_content (str): HTML content
             
         Returns:
-            dict: A dictionary with all extracted content
+            dict: Parsed content
         """
         soup = BeautifulSoup(html_content, 'html.parser')
         
@@ -208,76 +397,101 @@ class ConfluenceExtractor:
         # Extract tables
         tables = self._extract_tables(soup)
         
-        # Extract list items
-        lists = self._extract_lists(soup)
+        # Extract images 
+        images = self._extract_images(soup)
         
         # Extract code blocks
         code_blocks = self._extract_code_blocks(soup)
         
+        # Extract list items
+        lists = self._extract_lists(soup)
+        
         return {
             'text': text_content,
             'tables': tables,
+            'images': images,
+            'code_blocks': code_blocks,
             'lists': lists,
-            'code_blocks': code_blocks
+            'html': html_content  # Keep the original HTML for reference
         }
-
+    
     def _extract_text(self, soup):
         """
         Extract clean text content.
         
         Args:
-            soup (BeautifulSoup): The parsed HTML
+            soup (BeautifulSoup): Parsed HTML
             
         Returns:
-            str: The cleaned text content
+            str: Clean text
         """
+        # Clone the soup to avoid modifying the original
+        soup_clone = BeautifulSoup(str(soup), 'html.parser')
+        
         # Remove script and style elements
-        for element in soup(["script", "style"]):
+        for element in soup_clone(['script', 'style', 'noscript']):
             element.decompose()
-            
+        
         # Get text
-        text = soup.get_text()
+        text = soup_clone.get_text()
         
-        # Break into lines and remove leading and trailing space on each
+        # Clean up the text
         lines = (line.strip() for line in text.splitlines())
-        
-        # Break multi-headlines into a line each
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        
-        # Drop blank lines
         text = '\n'.join(chunk for chunk in chunks if chunk)
         
         return text
-
+    
     def _extract_tables(self, soup):
         """
         Extract tables from HTML.
         
         Args:
-            soup (BeautifulSoup): The parsed HTML
+            soup (BeautifulSoup): Parsed HTML
             
         Returns:
-            list: A list of tables as pandas DataFrames
+            list: List of extracted tables as pandas DataFrames
         """
         tables = []
         
         for table in soup.find_all('table'):
+            # Skip navigation and layout tables
+            if any(cls in table.get('class', []) for cls in ['pagetree', 'navtable', 'layout']):
+                continue
+                
             data = []
             headers = []
             
-            # Extract headers
-            headers_row = table.find('thead')
-            if headers_row:
-                headers = [header.get_text().strip() for header in headers_row.find_all('th')]
+            # Get headers
+            thead = table.find('thead')
+            if thead:
+                header_row = thead.find('tr')
+                if header_row:
+                    headers = [cell.get_text().strip() for cell in header_row.find_all(['th', 'td'])]
             
-            # If no headers found in thead, try the first row
+            # If no headers in thead, try the first row
             if not headers:
                 first_row = table.find('tr')
                 if first_row:
-                    headers = [header.get_text().strip() for header in first_row.find_all(['th', 'td'])]
+                    for cell in first_row.find_all(['th', 'td']):
+                        # Check if it's a header cell
+                        if cell.name == 'th' or 'header' in cell.get('class', []):
+                            headers.append(cell.get_text().strip())
+                        else:
+                            # Just a regular cell in the first row
+                            headers.append(f"Column {len(headers) + 1}")
             
-            # Extract data rows
-            for row in table.find_all('tr')[1:] if headers else table.find_all('tr'):
+            # Get data rows
+            tbody = table.find('tbody')
+            if tbody:
+                rows = tbody.find_all('tr')
+            else:
+                # If no tbody, get all rows and skip the first if we have headers
+                rows = table.find_all('tr')
+                if headers and rows:
+                    rows = rows[1:]
+            
+            for row in rows:
                 row_data = [cell.get_text().strip() for cell in row.find_all(['td', 'th'])]
                 if row_data:  # Skip empty rows
                     data.append(row_data)
@@ -288,19 +502,105 @@ class ConfluenceExtractor:
                     df = pd.DataFrame(data, columns=headers)
                 else:
                     df = pd.DataFrame(data)
+                
                 tables.append(df)
-            
+        
         return tables
-
-    def _extract_lists(self, soup):
+    
+    def _extract_images(self, soup):
         """
-        Extract list items.
+        Extract images from HTML.
         
         Args:
-            soup (BeautifulSoup): The parsed HTML
+            soup (BeautifulSoup): Parsed HTML
             
         Returns:
-            dict: A dictionary with ordered and unordered lists
+            list: List of image information
+        """
+        images = []
+        
+        for img in soup.find_all('img'):
+            src = img.get('src', '')
+            
+            # Skip emoticons, icons, and spacers
+            if any(skip in src.lower() for skip in ['emoticon', 'icon', 'spacer', 'blank.gif']):
+                continue
+                
+            alt = img.get('alt', '').strip()
+            title = img.get('title', '').strip() or alt
+            
+            if src:
+                if src.startswith('data:image'):
+                    # Handle data URLs
+                    image_type = 'data-url'
+                else:
+                    # Handle regular URLs
+                    image_type = 'url'
+                    
+                    # Make relative URLs absolute
+                    if src.startswith('/'):
+                        # We'll fix this later when we have the base URL
+                        image_type = 'relative'
+                
+                images.append({
+                    'src': src,
+                    'type': image_type,
+                    'alt': alt,
+                    'title': title
+                })
+        
+        return images
+    
+    def _extract_code_blocks(self, soup):
+        """
+        Extract code blocks from HTML.
+        
+        Args:
+            soup (BeautifulSoup): Parsed HTML
+            
+        Returns:
+            list: List of code blocks with language information
+        """
+        code_blocks = []
+        
+        # Look for different types of code blocks
+        for code in soup.select('pre, code, div.code, div.codeBlock, div.codeContent, span.code'):
+            code_text = code.get_text().strip()
+            if not code_text:
+                continue
+                
+            # Try to determine the language
+            language = None
+            
+            # Check for language classes
+            for cls in code.get('class', []):
+                if cls.startswith(('language-', 'brush:', 'lang-')):
+                    language = cls.split('-', 1)[1] if '-' in cls else cls.split(':', 1)[1] if ':' in cls else None
+                    break
+            
+            # Look for parent div that might have language info
+            if not language and code.parent:
+                for cls in code.parent.get('class', []):
+                    if cls.startswith(('language-', 'brush:', 'lang-')):
+                        language = cls.split('-', 1)[1] if '-' in cls else cls.split(':', 1)[1] if ':' in cls else None
+                        break
+            
+            code_blocks.append({
+                'code': code_text,
+                'language': language
+            })
+        
+        return code_blocks
+    
+    def _extract_lists(self, soup):
+        """
+        Extract lists from HTML.
+        
+        Args:
+            soup (BeautifulSoup): Parsed HTML
+            
+        Returns:
+            dict: Dictionary of ordered and unordered lists
         """
         lists = {
             'ordered': [],
@@ -309,223 +609,296 @@ class ConfluenceExtractor:
         
         # Extract ordered lists
         for ol in soup.find_all('ol'):
-            items = [li.get_text().strip() for li in ol.find_all('li')]
+            items = [li.get_text().strip() for li in ol.find_all('li', recursive=False)]
             if items:
                 lists['ordered'].append(items)
         
         # Extract unordered lists
         for ul in soup.find_all('ul'):
-            items = [li.get_text().strip() for li in ul.find_all('li')]
+            items = [li.get_text().strip() for li in ol.find_all('li', recursive=False)]
             if items:
                 lists['unordered'].append(items)
         
         return lists
-
-    def _extract_code_blocks(self, soup):
+    
+    def _save_content(self, content, output_dir, extract_images=True, save_tables=True, save_code=True):
         """
-        Extract code blocks.
+        Save extracted content to disk.
         
         Args:
-            soup (BeautifulSoup): The parsed HTML
-            
-        Returns:
-            list: A list of code blocks
+            content (dict): Extracted content
+            output_dir (str): Output directory
+            extract_images (bool): Whether to extract and save images
+            save_tables (bool): Whether to save tables as CSV files
+            save_code (bool): Whether to save code blocks as separate files
         """
-        code_blocks = []
+        # Make sure the output directory exists
+        os.makedirs(output_dir, exist_ok=True)
         
-        # Look for code blocks (different Confluence versions use different markup)
-        for code in soup.find_all(['pre', 'code', 'div', 'span'], class_=lambda c: c and ('code' in c or 'codeBlock' in c)):
-            code_text = code.get_text().strip()
-            if code_text:
-                code_blocks.append(code_text)
-        
-        return code_blocks
-
-    def extract_from_url(self, url, username=None, api_token=None, include_child_pages=False, max_depth=1):
-        """
-        Extract all content from a URL and optionally its child pages.
-        
-        Args:
-            url (str): The Confluence page URL
-            username (str, optional): Username for authentication
-            api_token (str, optional): API token for authentication
-            include_child_pages (bool, optional): Whether to include child pages
-            max_depth (int, optional): Maximum depth for child pages
+        # Save text content to a file
+        if 'text' in content:
+            with open(os.path.join(output_dir, 'content.txt'), 'w', encoding='utf-8') as f:
+                f.write(content['text'])
             
-        Returns:
-            dict: A dictionary with all extracted content
-        """
-        # Get content from the main page
-        content = self.get_page_content(url, username, api_token)
+            logger.info(f"Saved text content to {os.path.join(output_dir, 'content.txt')}")
         
-        # If including child pages and we haven't reached max depth
-        if include_child_pages and max_depth > 0 and 'child_pages' in content:
-            # Extract base URL
-            base_url = self._extract_base_url(url)
+        # Save original HTML
+        if 'html' in content:
+            with open(os.path.join(output_dir, 'original.html'), 'w', encoding='utf-8') as f:
+                f.write(content['html'])
             
-            # Process each child page
-            for i, child in enumerate(content['child_pages']):
-                child_id = child['id']
+            logger.info(f"Saved original HTML to {os.path.join(output_dir, 'original.html')}")
+        
+        # Save tables
+        if save_tables and 'tables' in content and content['tables']:
+            tables_dir = os.path.join(output_dir, 'tables')
+            os.makedirs(tables_dir, exist_ok=True)
+            
+            for i, table in enumerate(content['tables']):
+                table_file = os.path.join(tables_dir, f'table_{i+1}.csv')
+                table.to_csv(table_file, index=False, encoding='utf-8')
+            
+            logger.info(f"Saved {len(content['tables'])} tables to {tables_dir}")
+        
+        # Save code blocks
+        if save_code and 'code_blocks' in content and content['code_blocks']:
+            code_dir = os.path.join(output_dir, 'code')
+            os.makedirs(code_dir, exist_ok=True)
+            
+            for i, code_block in enumerate(content['code_blocks']):
+                language = code_block.get('language', 'txt')
+                extension = self._get_extension_for_language(language)
                 
-                # Generate child URL based on whether it's cloud or server
-                if 'atlassian.net' in url:
-                    # Cloud instance
-                    child_url = f"{base_url}/pages/{child_id}"
-                else:
-                    # Server instance
-                    child_url = f"{base_url}/pages/viewpage.action?pageId={child_id}"
-                
-                # Get child page content
+                code_file = os.path.join(code_dir, f'code_{i+1}{extension}')
+                with open(code_file, 'w', encoding='utf-8') as f:
+                    f.write(code_block['code'])
+            
+            logger.info(f"Saved {len(content['code_blocks'])} code blocks to {code_dir}")
+        
+        # Save images
+        if extract_images and 'images' in content and content['images']:
+            images_dir = os.path.join(output_dir, 'images')
+            os.makedirs(images_dir, exist_ok=True)
+            
+            # Get the base URL for resolving relative image URLs
+            base_url = None
+            if 'url' in content:
+                base_url = self._extract_base_url(content['url'])
+            
+            for i, image in enumerate(content['images']):
                 try:
-                    logger.info(f"Processing child page {i+1}/{len(content['child_pages'])}: {child['title']}")
-                    child_content = self.extract_from_url(
-                        child_url, 
-                        username, 
-                        api_token,
-                        include_child_pages=True, 
-                        max_depth=max_depth-1
-                    )
-                    content['child_pages'][i]['content'] = child_content
+                    image_file = os.path.join(images_dir, f'image_{i+1}.jpg')  # Default extension
+                    
+                    if image['type'] == 'data-url':
+                        # Handle data URLs
+                        data_url = image['src']
+                        data_url_pattern = re.compile(r'data:image/(?P<format>.*?);base64,(?P<data>.*)')
+                        match = data_url_pattern.match(data_url)
+                        
+                        if match:
+                            image_format = match.group('format')
+                            image_data = match.group('data')
+                            
+                            # Update the file extension
+                            image_file = os.path.join(images_dir, f'image_{i+1}.{image_format}')
+                            
+                            # Save the image
+                            with open(image_file, 'wb') as f:
+                                f.write(base64.b64decode(image_data))
+                    else:
+                        # Handle URL images
+                        image_url = image['src']
+                        
+                        # Resolve relative URLs
+                        if image['type'] == 'relative' and base_url:
+                            if image_url.startswith('/'):
+                                image_url = f"{base_url}{image_url}"
+                            else:
+                                image_url = f"{base_url}/{image_url}"
+                        
+                        # Download the image
+                        img_response = self.session.get(image_url, verify=False)
+                        
+                        if img_response.status_code == 200:
+                            # Try to determine the file extension from the Content-Type
+                            content_type = img_response.headers.get('Content-Type', '')
+                            if 'image/' in content_type:
+                                ext = content_type.split('/')[-1].split(';')[0]
+                                image_file = os.path.join(images_dir, f'image_{i+1}.{ext}')
+                            
+                            # Save the image
+                            with open(image_file, 'wb') as f:
+                                f.write(img_response.content)
                 except Exception as e:
-                    logger.error(f"Error processing child page {child['title']}: {e}")
-                    content['child_pages'][i]['error'] = str(e)
+                    logger.error(f"Error saving image {i+1}: {e}")
+            
+            logger.info(f"Saved images to {images_dir}")
         
-        return content
-
-    def extract_text_only(self, url, username=None, api_token=None, include_child_pages=False, max_depth=1):
+        # Create a metadata file
+        metadata = {
+            'title': content.get('title', 'Unknown'),
+            'url': content.get('url', ''),
+            'extraction_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'content_stats': {
+                'tables': len(content.get('tables', [])),
+                'code_blocks': len(content.get('code_blocks', [])),
+                'images': len(content.get('images', [])),
+                'text_length': len(content.get('text', '')),
+            }
+        }
+        
+        with open(os.path.join(output_dir, 'metadata.json'), 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2)
+    
+    def _get_extension_for_language(self, language):
         """
-        Extract only the text content from a URL and optionally its child pages.
-        This is a simplified method that returns just the text without tables, lists, etc.
+        Get the appropriate file extension for a programming language.
         
         Args:
-            url (str): The Confluence page URL
-            username (str, optional): Username for authentication
-            api_token (str, optional): API token for authentication
-            include_child_pages (bool, optional): Whether to include child pages
-            max_depth (int, optional): Maximum depth for child pages
+            language (str): Programming language
             
         Returns:
-            str: The extracted text content
+            str: File extension
         """
-        # Get full content
-        content = self.extract_from_url(url, username, api_token, include_child_pages, max_depth)
+        if not language:
+            return '.txt'
+            
+        language = language.lower()
         
-        # Start with the main page text
-        all_text = f"# {content['title']}\n\n{content['text']}\n\n"
+        extensions = {
+            'python': '.py',
+            'java': '.java',
+            'javascript': '.js',
+            'typescript': '.ts',
+            'html': '.html',
+            'css': '.css',
+            'c': '.c',
+            'cpp': '.cpp',
+            'c++': '.cpp',
+            'csharp': '.cs',
+            'c#': '.cs',
+            'ruby': '.rb',
+            'php': '.php',
+            'swift': '.swift',
+            'kotlin': '.kt',
+            'go': '.go',
+            'rust': '.rs',
+            'scala': '.scala',
+            'sql': '.sql',
+            'bash': '.sh',
+            'shell': '.sh',
+            'powershell': '.ps1',
+            'xml': '.xml',
+            'json': '.json',
+            'yaml': '.yaml',
+            'yml': '.yml',
+            'markdown': '.md',
+            'r': '.r'
+        }
         
-        # Add child page text if available
-        if include_child_pages and 'child_pages' in content:
-            for child in content['child_pages']:
-                if 'content' in child:
-                    all_text += f"\n\n## {child['title']}\n\n{child['content']['text']}\n\n"
+        return extensions.get(language, '.txt')
+    
+    def _sanitize_filename(self, filename):
+        """
+        Create a valid filename from a string.
         
-        return all_text
+        Args:
+            filename (str): String to sanitize
+            
+        Returns:
+            str: Sanitized filename
+        """
+        # Remove invalid characters
+        sanitized = re.sub(r'[\\/*?:"<>|]', '', filename)
+        # Replace spaces with underscores
+        sanitized = sanitized.replace(' ', '_')
+        # Ensure it's not just whitespace
+        if not sanitized or sanitized.isspace():
+            sanitized = "unnamed"
+        return sanitized
 
 
-def read_config_file(config_path):
+def extract_confluence_content(url, output_dir=None, config_path='config.txt', 
+                             include_children=False, max_depth=1, extract_images=True, 
+                             save_tables=True, save_code=True):
     """
-    Read the configuration file and return username and token.
+    Main function to extract content from a Confluence page.
     
     Args:
-        config_path (str): Path to the configuration file
+        url (str): Confluence page URL
+        output_dir (str): Directory to save content
+        config_path (str): Path to configuration file
+        include_children (bool): Whether to extract child pages
+        max_depth (int): Maximum depth for child pages
+        extract_images (bool): Whether to extract images
+        save_tables (bool): Whether to save tables
+        save_code (bool): Whether to save code blocks
         
     Returns:
-        tuple: (username, token)
+        dict: Results of the extraction
     """
+    extractor = ConfluenceExtractor()
+    
     try:
-        with open(config_path, 'r') as file:
-            config_data = file.read().strip().split('\n')
+        result = extractor.extract_content(
+            url=url,
+            config_path=config_path,
+            output_dir=output_dir,
+            include_children=include_children,
+            max_depth=max_depth,
+            extract_images=extract_images,
+            save_tables=save_tables,
+            save_code=save_code
+        )
         
-        config = {}
-        for line in config_data:
-            if '=' in line and not line.startswith('#'):
-                key, value = line.split('=', 1)
-                config[key.strip()] = value.strip()
-        
-        username = config.get('username')
-        token = config.get('token') or config.get('password')  # Accept either token or password
-        
-        return username, token
+        if result:
+            logger.info(f"Successfully extracted content from {url}")
+            logger.info(f"Content saved to {result['output_directory']}")
+            return result
+        else:
+            logger.error(f"Failed to extract content from {url}")
+            return None
     except Exception as e:
-        logger.error(f"Error reading config file: {e}")
-        return None, None
+        logger.error(f"Error extracting content: {e}")
+        return None
 
 
 def main():
+    """
+    Command-line interface for the Confluence content extractor.
+    """
     import argparse
     
-    parser = argparse.ArgumentParser(description='Extract content from any Confluence URL')
-    parser.add_argument('url', help='Confluence page URL')
-    parser.add_argument('--output', '-o', help='Output file to save the content')
-    parser.add_argument('--children', '-c', action='store_true', help='Include child pages')
-    parser.add_argument('--depth', '-d', type=int, default=1, help='Maximum depth for child pages')
-    parser.add_argument('--text-only', '-x', action='store_true', help='Extract only text content')
-    parser.add_argument('--config', default='config.txt', help='Path to configuration file with credentials (default: config.txt)')
+    parser = argparse.ArgumentParser(description='Extract content from any Confluence page')
+    parser.add_argument('url', help='URL of the Confluence page')
+    parser.add_argument('--output', '-o', help='Output directory (default: auto-generated)')
+    parser.add_argument('--config', '-c', default='config.txt', help='Path to config file (default: config.txt)')
+    parser.add_argument('--children', '-r', action='store_true', help='Extract child pages')
+    parser.add_argument('--depth', '-d', type=int, default=1, help='Maximum depth for child pages (default: 1)')
+    parser.add_argument('--no-images', action='store_true', help='Skip image extraction')
+    parser.add_argument('--no-tables', action='store_true', help='Skip table extraction')
+    parser.add_argument('--no-code', action='store_true', help='Skip code block extraction')
     
     args = parser.parse_args()
     
-    try:
-        # Read credentials from config file
-        username, token = read_config_file(args.config)
-        
-        if not username or not token:
-            print(f"Warning: Credentials not found in {args.config}")
-            print("Create a config.txt file with the following content:")
-            print("username=your_email@example.com")
-            print("token=your_api_token_or_password")
-            
-            # Ask if user wants to continue without authentication
-            response = input("Continue without authentication? (y/n): ")
-            if response.lower() != 'y':
-                print("Exiting.")
-                return
-        
-        # Create extractor
-        extractor = ConfluenceExtractor()
-        
-        # Get content based on options
-        if args.text_only:
-            content = extractor.extract_text_only(
-                args.url, 
-                username, 
-                token, 
-                args.children, 
-                args.depth
-            )
-            print(content)
-            
-            # Save to file if specified
-            if args.output:
-                with open(args.output, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                print(f"Content saved to {args.output}")
-        else:
-            content = extractor.extract_from_url(
-                args.url, 
-                username, 
-                token, 
-                args.children, 
-                args.depth
-            )
-            
-            # Print basic info
-            print(f"Title: {content['title']}")
-            print(f"URL: {content['url']}")
-            print(f"Text length: {len(content['text'])} characters")
-            print(f"Tables: {len(content['tables'])}")
-            
-            if 'child_pages' in content:
-                print(f"Child pages: {len(content['child_pages'])}")
-            
-            # Save to file if specified
-            if args.output:
-                import json
-                with open(args.output, 'w', encoding='utf-8') as f:
-                    json.dump(content, f, indent=2)
-                print(f"Content saved to {args.output}")
-            
-    except Exception as e:
-        print(f"Error: {e}")
+    result = extract_confluence_content(
+        url=args.url,
+        output_dir=args.output,
+        config_path=args.config,
+        include_children=args.children,
+        max_depth=args.depth,
+        extract_images=not args.no_images,
+        save_tables=not args.no_tables,
+        save_code=not args.no_code
+    )
+    
+    if result:
+        print(f"\nSuccess! Content has been extracted to: {result['output_directory']}")
+        if result['has_children'] and not args.children:
+            print("\nNote: This page has child pages that were not extracted.")
+            print("Use the --children option to extract child pages.")
+    else:
+        print("\nFailed to extract content. Check the logs for details.")
 
 
 if __name__ == "__main__":
